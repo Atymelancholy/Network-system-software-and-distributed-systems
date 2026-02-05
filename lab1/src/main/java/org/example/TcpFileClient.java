@@ -2,13 +2,21 @@ package org.example;
 
 import java.io.*;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.net.InetSocketAddress;
 
 public final class TcpFileClient {
+
+    private static final int SO_TIMEOUT_MS = 30_000;              // обнаружение в разумное время (30 сек)
+    private static final long AUTO_RECOVERY_WINDOW_MS = 90_000;   // автопопытки ДО сообщения (например 90 сек)
+    private static final long RETRY_DELAY_MS = 5_000;             // пауза между переподключениями
+
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             printUsageAndExit();
+            return;
         }
         String host = args[0];
         int port = Integer.parseInt(args[1]);
@@ -18,14 +26,23 @@ public final class TcpFileClient {
             case "echo" -> runSimple(host, port, "ECHO " + joinFrom(args, 3));
             case "close" -> runSimple(host, port, "CLOSE");
             case "upload" -> {
-                if (args.length < 5) printUsageAndExit();
+                if (args.length < 5) {
+                    printUsageAndExit();
+                    return;
+                }
                 upload(host, port, new File(args[3]), args[4]);
             }
             case "download" -> {
-                if (args.length < 5) printUsageAndExit();
+                if (args.length < 5) {
+                    printUsageAndExit();
+                    return;
+                }
                 download(host, port, args[3], new File(args[4]));
             }
-            default -> printUsageAndExit();
+            default -> {
+                printUsageAndExit();
+                return;
+            }
         }
     }
     private static void printUsageAndExit() {
@@ -36,6 +53,12 @@ public final class TcpFileClient {
           java TcpFileClient <host> <port> close
           java TcpFileClient <host> <port> upload <localPath> <remoteName>
           java TcpFileClient <host> <port> download <remoteName> <localPath>
+        Example:
+            java TcpFileClient 192.168.1.10 50505 time
+            java TcpFileClient 192.168.1.10 50505 echo hello world
+            java TcpFileClient 192.168.1.10 50505 close
+            java TcpFileClient 192.168.1.10 50505 upload ./big.bin big.bin
+            java TcpFileClient 192.168.1.10 50505 download big.bin ./big.bin
         """);
         System.exit(1);   // ← ВОТ ЭТА СТРОКА ГЛАВНАЯ
     }
@@ -58,6 +81,8 @@ public final class TcpFileClient {
         long totalSize = localFile.length();
         long offset = 0;
 
+        long deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS;
+
         while (true) {
             try (Session s = Session.connect(host, port)) {
                 String req = "UPLOAD " + remoteName + " " + totalSize + " " + offset;
@@ -67,63 +92,119 @@ public final class TcpFileClient {
                 if (resp == null) throw new IOException("Disconnected during handshake");
 
                 if (resp.startsWith("OK")) {
+                    deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS;
+
                     long sent = sendFileFromOffset(s.out, localFile, offset);
                     s.out.flush();
-                    System.out.println("UPLOAD finished. Sent bytes: " + sent);
-                    return;
+
+                    //offset += sent; // ✅ ВАЖНО: учитываем отправленное (для корректного resume после обрыва)
+
+                    String finalResp = s.readLine();
+                    if (finalResp == null) throw new IOException("Disconnected while waiting server confirmation");
+
+                    if (finalResp.startsWith("OK DONE")) {
+                        System.out.println("UPLOAD finished. Sent bytes: " + sent);
+                        return;
+                    }
+
+                    Long serverHas = parseServerHas(finalResp);
+                    if (serverHas != null && serverHas >= 0 && serverHas <= totalSize) {
+                        offset = serverHas;
+                        continue;
+                    }
+
+                    throw new IOException("Upload not confirmed: " + finalResp);
                 }
 
                 Long serverHas = parseServerHas(resp);
                 if (serverHas != null && serverHas >= 0 && serverHas <= totalSize) {
-                    System.out.println("Server has " + serverHas + " bytes already. Resuming...");
                     offset = serverHas;
                     continue;
                 }
 
                 throw new IOException("Server error: " + resp);
 
-            } catch (SocketTimeoutException e) {
-                System.out.println("Connection lost: timeout. Retry upload to resume.");
-                return; // по ТЗ: пользователь решает, продолжать ли после сообщения
+            } catch (SocketTimeoutException | SocketException e) {
+                if (System.currentTimeMillis() < deadline) {
+                    sleepSilently(RETRY_DELAY_MS);
+                    continue;
+                }
+                System.out.println("Connection problem during UPLOAD. Automatic recovery failed within "
+                        + (AUTO_RECOVERY_WINDOW_MS / 1000) + " seconds. Retry upload command to resume.");
+                return;
+
             } catch (IOException e) {
-                System.out.println("Connection lost: " + e.getMessage() + ". Retry upload to resume.");
-                return; // то же самое
+                if (System.currentTimeMillis() < deadline) {
+                    sleepSilently(RETRY_DELAY_MS);
+                    continue;
+                }
+                System.out.println("Connection problem during UPLOAD: " + e.getMessage()
+                        + ". Automatic recovery failed within " + (AUTO_RECOVERY_WINDOW_MS / 1000)
+                        + " seconds. Retry upload command to resume.");
+                return;
             }
         }
     }
 
     private static void download(String host, int port, String remoteName, File localFile) throws IOException {
-        long offset = localFile.exists() ? localFile.length() : 0L;
+        long deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS;
 
-        try (Session s = Session.connect(host, port)) {
-            String req = "DOWNLOAD " + remoteName + " " + offset;
-            s.sendLine(req);
+        while (true) {
+            long offset = localFile.exists() ? localFile.length() : 0L;
 
-            String resp = s.readLine();
-            if (resp == null) throw new IOException("Disconnected during handshake");
+            try (Session s = Session.connect(host, port)) {
+                String req = "DOWNLOAD " + remoteName + " " + offset;
+                s.sendLine(req);
 
-            if (!resp.startsWith("OK")) throw new IOException("Server error: " + resp);
+                String resp = s.readLine();
+                if (resp == null) throw new IOException("Disconnected during handshake");
+                if (!resp.startsWith("OK")) throw new IOException("Server error: " + resp);
 
-            long total = Long.parseLong(resp.split("\\s+")[1]);
-            if (offset > total) throw new IOException("Local file bigger than server file; delete local and retry");
+                deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS; // ✅ прогресс есть → окно автопочинки продлеваем
 
-            long toRead = total - offset;
-            long got = receiveToFile(s.in, localFile, offset, toRead);
+                long total = Long.parseLong(resp.split("\\s+")[1]);
+                if (offset > total) throw new IOException("Local file bigger than server file; delete local and retry");
 
-            if (got != toRead) {
-                System.out.println("Connection lost during download. Retry download to resume.");
+                long toRead = total - offset;
+                long got = receiveToFile(s.in, localFile, offset, toRead);
+
+                if (got > 0) {
+                    deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS; // ✅
+                }
+
+                if (got == toRead) {
+                    System.out.println("DOWNLOAD finished. Got bytes: " + got + " / " + toRead);
+                    return;
+                }
+
+                // если не дочитали — считаем это проблемой канала
+                throw new IOException("Disconnected during download stream");
+
+            } catch (SocketTimeoutException | SocketException e) {
+                if (System.currentTimeMillis() < deadline) {
+                    sleepSilently(RETRY_DELAY_MS);
+                    continue;
+                }
+                System.out.println("Connection problem during DOWNLOAD. Automatic recovery failed within "
+                        + (AUTO_RECOVERY_WINDOW_MS / 1000) + " seconds. Retry download command to resume.");
+                return;
+
+            } catch (IOException e) {
+                if (System.currentTimeMillis() < deadline) {
+                    sleepSilently(RETRY_DELAY_MS);
+                    continue;
+                }
+                System.out.println("Connection problem during DOWNLOAD: " + e.getMessage()
+                        + ". Automatic recovery failed within " + (AUTO_RECOVERY_WINDOW_MS / 1000)
+                        + " seconds. Retry download command to resume.");
                 return;
             }
-
-            System.out.println("DOWNLOAD finished. Got bytes: " + got + " / " + toRead);
-
-        } catch (SocketTimeoutException e) {
-            System.out.println("Connection lost: timeout. Retry download to resume.");
-        } catch (IOException e) {
-            System.out.println("Connection lost: " + e.getMessage() + ". Retry download to resume.");
         }
     }
     // ===== transfer helpers =====
+    private static void sleepSilently(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+    }
     private static long sendFileFromOffset(OutputStream out, File file, long offset) throws IOException {
         long startNs = System.nanoTime();
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
@@ -166,12 +247,16 @@ public final class TcpFileClient {
         System.out.printf("%s: %.2f Mbit/s (%d bytes in %.3f s)%n", label, mbit / sec, bytes, sec);
     }
     private static Long parseServerHas(String resp) {
-        // ожидаем "ERR Offset mismatch. Server has X"
         String marker = "Server has ";
         int i = resp.indexOf(marker);
         if (i < 0) return null;
+
         String tail = resp.substring(i + marker.length()).trim();
-        try { return Long.parseLong(tail); } catch (Exception e) { return null; }
+        int sp = tail.indexOf(' ');
+        if (sp >= 0) tail = tail.substring(0, sp);
+
+        try { return Long.parseLong(tail); }
+        catch (Exception e) { return null; }
     }
     private static String joinFrom(String[] args, int idx) {
         if (idx >= args.length) return "";
@@ -197,10 +282,12 @@ public final class TcpFileClient {
             this.writer = new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8));
         }
         static Session connect(String host, int port) throws IOException {
-            Socket s = new Socket(host, port);
-            s.setKeepAlive(true);        // SO_KEEPALIVE
-            s.setSoTimeout(120_000);
+            Socket s = new Socket();
+            s.setKeepAlive(true);
             s.setTcpNoDelay(true);
+            s.setSoTimeout(SO_TIMEOUT_MS);
+
+            s.connect(new InetSocketAddress(host, port), SO_TIMEOUT_MS); // таймаут на подключение
             return new Session(s);
         }
         void sendLine(String line) throws IOException {

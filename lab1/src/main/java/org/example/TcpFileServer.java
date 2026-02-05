@@ -115,9 +115,9 @@ public final class TcpFileServer {
         long toRead = totalSize - offset;
         long got = receiveToFile(in, target, offset, toRead);
         if (got == toRead) {
-            System.out.println("UPLOAD done: " + name + " total=" + totalSize);
+            sendLine(writer, out, "OK DONE " + totalSize);
         } else {
-            System.out.println("UPLOAD incomplete: " + name + " got=" + got + "/" + toRead);
+            sendLine(writer, out, "ERR INCOMPLETE Server has " + (offset + got));
         }
     }
 
@@ -210,7 +210,7 @@ public final class TcpFileServer {
 
     private void configureSocket(Socket socket) throws SocketException {
         socket.setKeepAlive(true);   // SO_KEEPALIVE
-        socket.setSoTimeout(120_000); // чтобы не висеть бесконечно
+        socket.setSoTimeout(60_000); // чтобы не висеть бесконечно
         socket.setTcpNoDelay(true);   // для команд удобно
     }
 
