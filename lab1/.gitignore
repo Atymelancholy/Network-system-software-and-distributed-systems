@@ -37,4 +37,4 @@ build/
 ### Mac OS ###
 .DS_Store
 
-.server_storage
+.server_storage/*
