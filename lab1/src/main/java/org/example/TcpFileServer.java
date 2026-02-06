@@ -220,7 +220,7 @@ public final class TcpFileServer {
 
     private void configureSocket(Socket socket) throws SocketException {
         socket.setKeepAlive(true);   // SO_KEEPALIVE
-        socket.setSoTimeout(60_000); // чтобы не висеть бесконечно
+        socket.setSoTimeout(120_000); // чтобы не висеть бесконечно
         socket.setTcpNoDelay(true);   // для команд удобно
     }
 
