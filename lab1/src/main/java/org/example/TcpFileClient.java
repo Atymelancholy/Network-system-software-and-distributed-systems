@@ -97,7 +97,7 @@ public final class TcpFileClient {
                     long sent = sendFileFromOffset(s.out, localFile, offset);
                     s.out.flush();
 
-                    //offset += sent; // ✅ ВАЖНО: учитываем отправленное (для корректного resume после обрыва)
+                    offset += sent; // ✅ ВАЖНО: учитываем отправленное (для корректного resume после обрыва)
 
                     String finalResp = s.readLine();
                     if (finalResp == null) throw new IOException("Disconnected while waiting server confirmation");
@@ -154,6 +154,9 @@ public final class TcpFileClient {
 
             try (Session s = Session.connect(host, port)) {
                 String req = "DOWNLOAD " + remoteName + " " + offset;
+                System.out.println("DOWNLOAD request: name=" + remoteName + " localPath=" + localFile.getPath()
+                        + " offset=" + offset + " (localSize=" + offset + ")");
+
                 s.sendLine(req);
 
                 String resp = s.readLine();
@@ -267,43 +270,60 @@ public final class TcpFileClient {
         }
         return sb.toString();
     }
+    static String readLine(InputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(128);
+        while (true) {
+            int b = in.read();
+            if (b == -1) {
+                return buf.size() == 0 ? null : buf.toString(StandardCharsets.UTF_8);
+            }
+            if (b == '\n') break;
+            if (b != '\r') buf.write(b);
+            // можно добавить лимит на длину строки, чтобы защититься от мусора
+        }
+        return buf.toString(StandardCharsets.UTF_8);
+    }
+
+    static void sendLine(OutputStream out, String line) throws IOException {
+        out.write(line.getBytes(StandardCharsets.UTF_8));
+        out.write('\n');
+        out.flush();
+    }
     // ===== Session wrapper =====
     private static final class Session implements Closeable {
         final Socket socket;
         final InputStream in;
         final OutputStream out;
-        final BufferedReader reader;
-        final BufferedWriter writer;
+
         private Session(Socket socket) throws IOException {
             this.socket = socket;
             this.in = new BufferedInputStream(socket.getInputStream());
             this.out = new BufferedOutputStream(socket.getOutputStream());
-            this.reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
-            this.writer = new BufferedWriter(new OutputStreamWriter(out, StandardCharsets.UTF_8));
         }
+
         static Session connect(String host, int port) throws IOException {
             Socket s = new Socket();
             s.setKeepAlive(true);
             s.setTcpNoDelay(true);
             s.setSoTimeout(SO_TIMEOUT_MS);
-
-            s.connect(new InetSocketAddress(host, port), SO_TIMEOUT_MS); // таймаут на подключение
+            s.connect(new InetSocketAddress(host, port), SO_TIMEOUT_MS);
             return new Session(s);
         }
+
         void sendLine(String line) throws IOException {
-            writer.write(line);
-            writer.write("\n");
-            writer.flush();
-            out.flush();
+            TcpFileClient.sendLine(out, line);
         }
+
         String readLine() throws IOException {
-            return reader.readLine();
+            return TcpFileClient.readLine(in);
         }
+
         String sendLineAndReadLine(String line) throws IOException {
             sendLine(line);
             return readLine();
         }
-        @Override public void close() throws IOException {
+
+        @Override public void close() {
             try { socket.close(); } catch (Exception ignored) {}
         }
     }

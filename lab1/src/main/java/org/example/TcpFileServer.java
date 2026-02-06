@@ -46,11 +46,8 @@ public final class TcpFileServer {
         InputStream rawIn = new BufferedInputStream(socket.getInputStream());
         OutputStream rawOut = new BufferedOutputStream(socket.getOutputStream());
 
-        BufferedReader reader = new BufferedReader(new InputStreamReader(rawIn, StandardCharsets.UTF_8));
-        BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(rawOut, StandardCharsets.UTF_8));
-
         while (true) {
-            String line = reader.readLine(); // команды читаем только построчно
+            String line = readLine(rawIn); // ✅ читаем строго до \n, без лишнего буфера
             if (line == null) {
                 System.out.println("Client disconnected (EOF)");
                 return;
@@ -63,30 +60,30 @@ public final class TcpFileServer {
             String cmd = parts[0].toUpperCase();
 
             switch (cmd) {
-                case "ECHO" -> handleEcho(line, writer, rawOut);
-                case "TIME" -> handleTime(writer, rawOut);
-                case "CLOSE", "EXIT", "QUIT" -> { sendLine(writer, rawOut, "BYE"); return; }
-                case "UPLOAD" -> handleUpload(parts, rawIn, writer, rawOut);
-                case "DOWNLOAD" -> handleDownload(parts, writer, rawOut);
-                default -> sendLine(writer, rawOut, "ERR Unknown command");
+                case "ECHO" -> handleEcho(line, rawOut);
+                case "TIME" -> handleTime(rawOut);
+                case "CLOSE", "EXIT", "QUIT" -> { sendLine(rawOut, "BYE"); return; }
+                case "UPLOAD" -> handleUpload(parts, rawIn, rawOut);
+                case "DOWNLOAD" -> handleDownload(parts, rawOut);
+                default -> sendLine(rawOut, "ERR Unknown command");
             }
         }
     }
 
-    private void handleEcho(String line, BufferedWriter writer, OutputStream out) throws IOException {
+    private void handleEcho(String line, OutputStream out) throws IOException {
         String payload = line.length() > 4 ? line.substring(4).trim() : "";
-        sendLine(writer, out, "OK " + payload);
+        sendLine(out, "OK " + payload);
     }
 
-    private void handleTime(BufferedWriter writer, OutputStream out) throws IOException {
-        sendLine(writer, out, "OK " + Instant.now());
+    private void handleTime(OutputStream out) throws IOException {
+        sendLine(out, "OK " + Instant.now());
     }
 
     // UPLOAD <name> <totalSize> <offset>
     // Далее клиент отправляет totalSize-offset байт
-    private void handleUpload(String[] parts, InputStream in, BufferedWriter writer, OutputStream out) throws IOException {
+    private void handleUpload(String[] parts, InputStream in, OutputStream out) throws IOException {
         if (parts.length < 4) {
-            sendLine(writer, out, "ERR Usage: UPLOAD <name> <size> <offset>");
+            sendLine(out, "ERR Usage: UPLOAD <name> <size> <offset>");
             return;
         }
 
@@ -95,7 +92,7 @@ public final class TcpFileServer {
         long offset = parseLong(parts[3], -1);
 
         if (name == null || totalSize < 0 || offset < 0 || offset > totalSize) {
-            sendLine(writer, out, "ERR Bad args");
+            sendLine(out, "ERR Bad args");
             return;
         }
 
@@ -104,56 +101,76 @@ public final class TcpFileServer {
 
         long current = target.exists() ? target.length() : 0L;
 
-        // В лоб, но правильно для докачки: offset должен совпадать с текущим размером.
         if (offset != current) {
-            sendLine(writer, out, "ERR Offset mismatch. Server has " + current);
+            sendLine(out, "ERR Offset mismatch. Server has " + current);
             return;
         }
 
-        sendLine(writer, out, "OK");
+        sendLine(out, "OK");
 
         long toRead = totalSize - offset;
         long got = receiveToFile(in, target, offset, toRead);
+
         if (got == toRead) {
-            sendLine(writer, out, "OK DONE " + totalSize);
+            sendLine(out, "OK DONE " + totalSize);
         } else {
-            sendLine(writer, out, "ERR INCOMPLETE Server has " + (offset + got));
+            sendLine(out, "ERR INCOMPLETE Server has " + (offset + got));
         }
     }
 
     // DOWNLOAD <name> <offset>
     // Сервер отвечает: OK <totalSize> и затем отправляет totalSize-offset байт
-    private void handleDownload(String[] parts, BufferedWriter writer, OutputStream out) throws IOException {
+    private void handleDownload(String[] parts, OutputStream out) throws IOException {
         if (parts.length < 3) {
-            sendLine(writer, out, "ERR Usage: DOWNLOAD <name> <offset>");
+            sendLine(out, "ERR Usage: DOWNLOAD <name> <offset>");
             return;
         }
 
         String name = sanitizeFileName(parts[1]);
         long offset = parseLong(parts[2], -1);
         if (name == null || offset < 0) {
-            sendLine(writer, out, "ERR Bad args");
+            sendLine(out, "ERR Bad args");
             return;
         }
 
         File source = new File(baseDir, name);
         if (!source.exists() || !source.isFile()) {
-            sendLine(writer, out, "ERR No such file");
+            sendLine(out, "ERR No such file");
             return;
         }
 
         long total = source.length();
         if (offset > total) {
-            sendLine(writer, out, "ERR Offset too big");
+            sendLine(out, "ERR Offset too big");
             return;
         }
 
-        sendLine(writer, out, "OK " + total);
+        System.out.println("DOWNLOAD cmd: name=" + name + " offset=" + offset + " total=" + total
+                + " willSend=" + (total - offset));
+
+        sendLine(out, "OK " + total);
         sendFile(out, source, offset);
         out.flush();
     }
 
     // ===== data transfer =====
+
+    private static String readLine(InputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(128);
+        while (true) {
+            int b = in.read();
+            if (b == -1) return buf.size() == 0 ? null : buf.toString(StandardCharsets.UTF_8);
+            if (b == '\n') break;
+            if (b != '\r') buf.write(b);
+        }
+        return buf.toString(StandardCharsets.UTF_8);
+    }
+
+    private static void sendLine(OutputStream out, String line) throws IOException {
+        out.write(line.getBytes(StandardCharsets.UTF_8));
+        out.write('\n');
+        out.flush();
+    }
 
     private long receiveToFile(InputStream in, File file, long offset, long toRead) throws IOException {
         long startNs = System.nanoTime();
@@ -200,13 +217,6 @@ public final class TcpFileServer {
     }
 
     // ===== io helpers =====
-
-    private void sendLine(BufferedWriter writer, OutputStream out, String line) throws IOException {
-        writer.write(line);
-        writer.write("\n");
-        writer.flush();
-        out.flush();
-    }
 
     private void configureSocket(Socket socket) throws SocketException {
         socket.setKeepAlive(true);   // SO_KEEPALIVE
