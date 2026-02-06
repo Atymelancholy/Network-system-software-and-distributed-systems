@@ -9,12 +9,12 @@ import java.net.InetSocketAddress;
 
 public final class TcpFileClient {
 
-    private static final long NO_PROGRESS_LIMIT_MS = 30_000;
+    private static final long NO_PROGRESS_LIMIT_MS = 60_000;
     // обнаружение в разумное время (30 сек)
     private static final long AUTO_RECOVERY_WINDOW_MS = 90_000;   // автопопытки ДО сообщения (например 90 сек)
     private static final long RETRY_DELAY_MS = 5_000;
     private static final int CONNECT_TIMEOUT_MS = 30_000;
-    private static final int READ_TIMEOUT_MS = 3_000;
+    private static final int READ_TIMEOUT_MS = 30_000;
 // пауза между переподключениями
 private static final int MAX_LINE = 8 * 1024;
 
@@ -181,9 +181,16 @@ private static final int MAX_LINE = 8 * 1024;
                 }
 
                 if (got == toRead) {
+                    // ✅ дочитали байты — теперь ждём подтверждение конца
+                    String done = s.readLine();
+                    if (done == null || !done.startsWith("OK DONE")) {
+                        throw new IOException("Server did not confirm DONE: " + done);
+                    }
+
                     System.out.println("DOWNLOAD finished. Got bytes: " + got + " / " + toRead);
                     return;
                 }
+
 
                 // если не дочитали — считаем это проблемой канала
                 throw new IOException("Disconnected during download stream");
@@ -224,7 +231,9 @@ private static final int MAX_LINE = 8 * 1024;
                 int want = (int) Math.min(buf.length, remaining);
                 try {
                     int n = s.in.read(buf, 0, want);
-                    if (n == -1) break;
+                    if (n == -1) {
+                        throw new EOFException("EOF during download stream, remaining=" + remaining);
+                    }
                     raf.write(buf, 0, n);
                     remaining -= n;
                     totalRead += n;

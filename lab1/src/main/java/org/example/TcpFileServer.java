@@ -150,7 +150,12 @@ public final class TcpFileServer {
 
         sendLine(out, "OK " + total);
         sendFile(out, source, offset);
-        out.flush();
+        out.flush();  // возможно надо опустить на 156 строку
+// ✅ подтверждение конца передачи на уровне приложения
+        sendLine(out, "OK DONE " + total);
+
+
+
     }
 
     // ===== data transfer =====
@@ -185,7 +190,9 @@ public final class TcpFileServer {
             while (remaining > 0) {
                 int want = (int) Math.min(buf.length, remaining);
                 int n = in.read(buf, 0, want);
-                if (n == -1) break;
+                if (n == -1) {
+                    throw new EOFException("EOF during upload stream, remaining=" + remaining);
+                }
                 raf.write(buf, 0, n);
                 remaining -= n;
                 totalRead += n;
