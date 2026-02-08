@@ -212,6 +212,9 @@ public final class TcpFileServer {
                 totalSent += n;
             }
 
+            if (totalSent == raf.length() - offset) {
+                sendLine(out, "OK DONE " + totalSent);
+            }
             printBitrate("DOWNLOAD bitrate", totalSent, startNs);
         }
     }
