@@ -291,6 +291,11 @@ public final class UdpFileClient {
                     }
                 }
 
+                for (int i = 0; i < 5; i++) {
+                    sendAck(s, transferId, received, totalChunks);
+                    try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+                }
+
                 // подтверждаем финал
                 send(s.sock, s.server, T_FIN, s.sessionId, transferId, 0, 0, 0, new byte[0]);
 
