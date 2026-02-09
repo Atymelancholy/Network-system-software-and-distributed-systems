@@ -276,8 +276,26 @@ public final class UdpFileClient {
 
                 // подтверждаем финал
                 send(s.sock, s.server, T_FIN, s.sessionId, transferId, 0, 0, 0, new byte[0]);
-                Packet fin = recv(s.sock, 2000);
-                if (fin != null) System.out.println(fin.payloadText());
+
+                Packet finResp = null;
+                long deadline = System.currentTimeMillis() + 2000;
+
+                while (System.currentTimeMillis() < deadline) {
+                    Packet pkt = recv(s.sock, 300);
+                    if (pkt == null) continue;
+
+                    // Игнорируем запоздавшие DATA
+                    if (pkt.type == T_DATA) continue;
+
+                    // Берём только текстовый ответ
+                    if ((pkt.type == T_CMD_RESP || pkt.type == T_ERR) && pkt.transferId == transferId) {
+                        finResp = pkt;
+                        break;
+                    }
+                }
+
+                if (finResp != null) System.out.println(finResp.payloadText());
+                else System.out.println("FIN response: timeout (maybe last DATA arrived late)");
             }
 
             printBitrate("DOWNLOAD bitrate", total, startNs);
