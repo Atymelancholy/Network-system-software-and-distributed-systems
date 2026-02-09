@@ -11,6 +11,14 @@ public final class UdpFileClient {
     // ===== defaults =====
     private static final int DEFAULT_PORT = 50506;
 
+    // tuning (fast LAN / hotspot)
+    private static final int RX_POLL_MS = 10;            // вместо 2000ms
+    private static final int ACK_EVERY_PACKETS = 16;     // ACK каждые N пакетов
+    private static final long ACK_EVERY_NS = 2_000_000;  // или каждые 2ms
+    private static final int SO_RCVBUF = 4 * 1024 * 1024;
+    private static final int SO_SNDBUF = 4 * 1024 * 1024;
+
+
     // протокол
     private static final short MAGIC = (short) 0x5546; // 'U''F'
     private static final byte VER = 1;
@@ -101,9 +109,15 @@ public final class UdpFileClient {
 
         Session(InetSocketAddress server) throws SocketException {
             this.sock = new DatagramSocket();
+            this.sock.setReceiveBufferSize(SO_RCVBUF);
+            this.sock.setSendBufferSize(SO_SNDBUF);
             this.server = server;
             this.sessionId = new Random().nextLong();
+
+            // Важно: connect() фиксирует peer и позволяет ОС фильтровать мусор
+            this.sock.connect(server);
         }
+
 
         @Override public void close() { sock.close(); }
     }
@@ -262,13 +276,23 @@ public final class UdpFileClient {
                 int base = 0;
                 long lastAckSent = 0;
 
+                long lastAckNs = System.nanoTime();
+                int packetsSinceAck = 0;
+
                 while (base < totalChunks) {
-                    Packet pkt = recv(s.sock, 2000, s.sessionId);
+                    Packet pkt = recv(s.sock, RX_POLL_MS, s.sessionId);
+                    long nowNs = System.nanoTime();
+
                     if (pkt == null) {
-                        // если REJECT/DROP/обрыв — просто перекидываем ACK (сервер дослёт)
-                        sendAck(s, transferId, received, totalChunks);
+                        // не зависаем на 2 секунды — просто периодически подтверждаем
+                        if (nowNs - lastAckNs > ACK_EVERY_NS) {
+                            sendAck(s, transferId, received, totalChunks);
+                            lastAckNs = nowNs;
+                            packetsSinceAck = 0;
+                        }
                         continue;
                     }
+
                     if (pkt.type == T_DATA && pkt.transferId == transferId) {
                         int seq = pkt.seq;
                         if (seq >= 0 && seq < totalChunks) {
@@ -279,17 +303,28 @@ public final class UdpFileClient {
                                 received.set(seq);
                             }
                             base = received.nextClearBit(0);
-                            // ACK не на каждый пакет (чтобы не забить канал): раз в ~20мс или при продвижении base
-                            long now = System.currentTimeMillis();
-                            if (now - lastAckSent > 20 || base == seq) {
+                            packetsSinceAck++;
+
+                            // ACK чаще: каждые 16 пакетов ИЛИ каждые 2ms ИЛИ когда base продвинулся
+                            if (packetsSinceAck >= ACK_EVERY_PACKETS || (nowNs - lastAckNs) > ACK_EVERY_NS) {
                                 sendAck(s, transferId, received, totalChunks);
-                                lastAckSent = now;
+                                lastAckNs = nowNs;
+                                packetsSinceAck = 0;
                             }
                         }
                     } else if (pkt.type == T_ERR) {
                         throw new IOException(pkt.payloadText());
                     }
                 }
+
+// финальные подтверждения (чтобы сервер точно увидел "DONE")
+                for (int i = 0; i < 10; i++) {
+                    sendAck(s, transferId, received, totalChunks);
+                    try { Thread.sleep(1); } catch (InterruptedException ignored) {}
+                }
+
+// потом FIN
+                send(s.sock, s.server, T_FIN, s.sessionId, transferId, 0, 0, 0, new byte[0]);
 
                 for (int i = 0; i < 5; i++) {
                     sendAck(s, transferId, received, totalChunks);
