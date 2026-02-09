@@ -10,6 +10,10 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class UdpFileServer {
 
+    private static final int DL_WINDOW = 256;     // окно для download
+    private static final int DL_RTO_MS = 50;      // быстрее, чем 120/1000
+    private static final int DL_MAX_RETRY = 200;  // на hotspot бывает больше потерь
+
     // ===== defaults =====
     private static final int DEFAULT_PORT = 50506;
     private static final String DEFAULT_DIR = "server_storage_udp";
@@ -109,6 +113,11 @@ public final class UdpFileServer {
         long startedNs = System.nanoTime();
         long bytesDone = 0;
 
+        // только для download-сендера
+        final BitSet sent = new BitSet();
+        final long[] sentAt;
+        final int[] retries;
+
         TransferState(boolean upload, File file, RandomAccessFile raf,
                       long totalBytes, int chunkSize, int totalChunks) {
             this.upload = upload;
@@ -118,7 +127,11 @@ public final class UdpFileServer {
             this.chunkSize = chunkSize;
             this.totalChunks = totalChunks;
             this.received = new BitSet(totalChunks);
+
+            this.sentAt = new long[totalChunks];
+            this.retries = new int[totalChunks];
         }
+
 
         void touch() { lastTouchMs = System.currentTimeMillis(); }
         void closeQuiet() { try { raf.close(); } catch (Exception ignored) {} }
@@ -264,7 +277,7 @@ public final class UdpFileServer {
 
         // стартуем «пуш» данных: сервер будет слать DATA, а клиент слать ACK
         // (управление окном — на стороне сервера в handleAck)
-        sendMoreDownloadData(sock, peer, sessionId, transferId, st, 0, 64); // initial burst (window=64)
+        sendMoreDownloadData(sock, peer, sessionId, transferId, st, 0, DL_WINDOW); // initial burst (window=64)
     }
 
     private void handleData(DatagramSocket sock, SocketAddress peer, long sessionId, int transferId, int seq, byte[] payload) throws IOException {
@@ -316,8 +329,8 @@ public final class UdpFileServer {
 
         // досылаем новые данные по окну
         int base = st.received.nextClearBit(0);
-        int window = 64; // можно сделать параметром
-        sendMoreDownloadData(sock, peer, sessionId, transferId, st, base, window);
+ // можно сделать параметром
+        sendMoreDownloadData(sock, peer, sessionId, transferId, st, base, DL_WINDOW);
     }
 
     private void handleFin(DatagramSocket sock, SocketAddress peer, long sessionId, int transferId) throws IOException {
@@ -349,22 +362,34 @@ public final class UdpFileServer {
                                       TransferState st, int base, int window) throws IOException {
         if (st == null) return;
 
-        int sent = 0;
-        for (int seq = base; seq < st.totalChunks && seq < base + window; seq++) {
-            if (st.received.get(seq)) continue;
+        long now = System.currentTimeMillis();
+        int end = Math.min(st.totalChunks, base + window);
+
+        for (int seq = base; seq < end; seq++) {
+            if (st.received.get(seq)) continue; // уже acked клиентом
+
+            boolean needSend = !st.sent.get(seq) || (now - st.sentAt[seq] > DL_RTO_MS);
+            if (!needSend) continue;
+
+            if (st.sent.get(seq) && st.retries[seq]++ > DL_MAX_RETRY) {
+                // если реально всё плохо — можно просто перестать спамить
+                continue;
+            }
 
             long offset = (long) seq * st.chunkSize;
             int len = (int) Math.min(st.chunkSize, st.totalBytes - offset);
-            byte[] data = new byte[len];
 
+            byte[] data = new byte[len];
             st.raf.seek(offset);
             st.raf.readFully(data);
 
             send(sock, peer, T_DATA, sessionId, transferId, seq, 0, 0, data);
-            st.bytesDone += len;
-            sent++;
+
+            st.sent.set(seq);
+            st.sentAt[seq] = now;
         }
-        if (sent > 0) st.touch();
+
+        st.touch();
     }
 
     // ===== ack builder (for uploads) =====
