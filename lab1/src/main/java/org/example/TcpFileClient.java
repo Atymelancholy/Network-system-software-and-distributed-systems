@@ -9,9 +9,14 @@ import java.net.InetSocketAddress;
 
 public final class TcpFileClient {
 
-    private static final int SO_TIMEOUT_MS = 30_000;              // обнаружение в разумное время (30 сек)
+    private static final long NO_PROGRESS_LIMIT_MS = 60_000;
+    // обнаружение в разумное время (30 сек)
     private static final long AUTO_RECOVERY_WINDOW_MS = 90_000;   // автопопытки ДО сообщения (например 90 сек)
-    private static final long RETRY_DELAY_MS = 5_000;             // пауза между переподключениями
+    private static final long RETRY_DELAY_MS = 5_000;
+    private static final int CONNECT_TIMEOUT_MS = 30_000;
+    private static final int READ_TIMEOUT_MS = 30_000;
+// пауза между переподключениями
+private static final int MAX_LINE = 8 * 1024;
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
@@ -169,16 +174,23 @@ public final class TcpFileClient {
                 if (offset > total) throw new IOException("Local file bigger than server file; delete local and retry");
 
                 long toRead = total - offset;
-                long got = receiveToFile(s.in, localFile, offset, toRead);
+                long got = receiveToFileWithProgress(s, localFile, offset, toRead);
 
                 if (got > 0) {
                     deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS; // ✅
                 }
 
                 if (got == toRead) {
+                    // ✅ дочитали байты — теперь ждём подтверждение конца
+                    String done = s.readLine();
+                    if (done == null || !done.startsWith("OK DONE")) {
+                        throw new IOException("Server did not confirm DONE: " + done);
+                    }
+
                     System.out.println("DOWNLOAD finished. Got bytes: " + got + " / " + toRead);
                     return;
                 }
+
 
                 // если не дочитали — считаем это проблемой канала
                 throw new IOException("Disconnected during download stream");
@@ -204,6 +216,44 @@ public final class TcpFileClient {
             }
         }
     }
+
+    private static long receiveToFileWithProgress(Session s, File file, long offset, long toRead) throws IOException {
+        long startNs = System.nanoTime();
+        long lastProgress = System.currentTimeMillis();
+
+        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+            raf.seek(offset);
+            byte[] buf = new byte[64 * 1024];
+            long remaining = toRead;
+            long totalRead = 0;
+
+            while (remaining > 0) {
+                int want = (int) Math.min(buf.length, remaining);
+                try {
+                    int n = s.in.read(buf, 0, want);
+                    if (n == -1) {
+                        throw new EOFException("EOF during download stream, remaining=" + remaining);
+                    }
+                    raf.write(buf, 0, n);
+                    remaining -= n;
+                    totalRead += n;
+                    lastProgress = System.currentTimeMillis();
+                } catch (SocketTimeoutException te) {
+                    // просто нет данных сейчас — проверяем, сколько уже ждём без прогресса
+                    long stall = System.currentTimeMillis() - lastProgress;
+                    if (stall >= NO_PROGRESS_LIMIT_MS) {
+                        System.out.println("DOWNLOAD: no data for " + stall + " ms -> reconnect/resume");
+                        throw te;
+                    }
+                    // иначе ждём дальше
+                }
+            }
+
+            printBitrate("DOWNLOAD bitrate", totalRead, startNs);
+            return totalRead;
+        }
+    }
+
     // ===== transfer helpers =====
     private static void sleepSilently(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
@@ -222,25 +272,6 @@ public final class TcpFileClient {
             }
             printBitrate("UPLOAD bitrate", totalSent, startNs);
             return totalSent;
-        }
-    }
-    private static long receiveToFile(InputStream in, File file, long offset, long toRead) throws IOException {
-        long startNs = System.nanoTime();
-        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
-            raf.seek(offset);
-            byte[] buf = new byte[64 * 1024];
-            long remaining = toRead;
-            long totalRead = 0;
-            while (remaining > 0) {
-                int want = (int) Math.min(buf.length, remaining);
-                int n = in.read(buf, 0, want);
-                if (n == -1) break;
-                raf.write(buf, 0, n);
-                remaining -= n;
-                totalRead += n;
-            }
-            printBitrate("DOWNLOAD bitrate", totalRead, startNs);
-            return totalRead;
         }
     }
     private static void printBitrate(String label, long bytes, long startNs) {
@@ -274,16 +305,13 @@ public final class TcpFileClient {
         ByteArrayOutputStream buf = new ByteArrayOutputStream(128);
         while (true) {
             int b = in.read();
-            if (b == -1) {
-                return buf.size() == 0 ? null : buf.toString(StandardCharsets.UTF_8);
-            }
+            if (b == -1) return buf.size() == 0 ? null : buf.toString(StandardCharsets.UTF_8);
             if (b == '\n') break;
             if (b != '\r') buf.write(b);
-            // можно добавить лимит на длину строки, чтобы защититься от мусора
+            if (buf.size() > MAX_LINE) throw new IOException("Line too long");
         }
         return buf.toString(StandardCharsets.UTF_8);
     }
-
     static void sendLine(OutputStream out, String line) throws IOException {
         out.write(line.getBytes(StandardCharsets.UTF_8));
         out.write('\n');
@@ -305,8 +333,9 @@ public final class TcpFileClient {
             Socket s = new Socket();
             s.setKeepAlive(true);
             s.setTcpNoDelay(true);
-            s.setSoTimeout(SO_TIMEOUT_MS);
-            s.connect(new InetSocketAddress(host, port), SO_TIMEOUT_MS);
+
+            s.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS); // ✅ отдельный таймаут на connect
+            s.setSoTimeout(READ_TIMEOUT_MS);                                  // ✅ отдельный таймаут на read
             return new Session(s);
         }
 

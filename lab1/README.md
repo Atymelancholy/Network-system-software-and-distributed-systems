@@ -24,7 +24,7 @@ java -cp out org.example.TcpFileServer 50505 server_storage
 
 Windows:
 
-java -cp <путь_к_classes> org.example.TcpFileClient <host> <port> time
+java -cp <путь_к_classes> org.example.TcpFileClient <_host> <_port> time
 
 java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 time
 
@@ -36,7 +36,7 @@ java -cp out org.example.TcpFileClient 127.0.0.1 50505 time
 
 Windows:
 
-java -cp <путь_к_classes> org.example.TcpFileClient <host> <port> echo <текст>
+java -cp <путь_к_classes> org.example.TcpFileClient <_host> <_port> echo <текст>
 
 java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 echo hello world
 
@@ -48,7 +48,7 @@ java -cp out org.example.TcpFileClient 127.0.0.1 50505 echo hello
 
 Windows:
 
-java -cp <путь_к_classes> org.example.TcpFileClient <host> <port> close
+java -cp <путь_к_classes> org.example.TcpFileClient <_host> <_port> close
 
 java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 close
 
@@ -60,7 +60,7 @@ java -cp out org.example.TcpFileClient 127.0.0.1 50505 close
 
 Windows:
 
-java -cp <путь_к_classes> org.example.TcpFileClient <host> <port> upload <локальный_файл> <имя_на_сервере>
+java -cp <путь_к_classes> org.example.TcpFileClient <_host> <_port> upload <локальный_файл> <имя_на_сервере>
 
 java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 upload C:\temp\big.bin big.bin
 
@@ -72,7 +72,7 @@ java -cp out org.example.TcpFileClient 127.0.0.1 50505 upload ./big.bin big.bin
 
 Windows:
 
-java -cp <путь_к_classes> org.example.TcpFileClient <host> <port> download <имя_на_сервере> <локальный_файл>
+java -cp <путь_к_classes> org.example.TcpFileClient <_host> <_port> download <имя_на_сервере> <локальный_файл>
 
 java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 download big.bin C:\temp\big_download.bin
 
