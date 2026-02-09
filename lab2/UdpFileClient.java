@@ -224,11 +224,28 @@ public final class UdpFileClient {
             String meta = remote + "\n" + chunk + "\n";
             send(s.sock, s.server, T_START_DOWNLOAD, s.sessionId, 0, 0, 0, 0, meta.getBytes(StandardCharsets.UTF_8));
 
-            Packet startResp = recv(s.sock, 3000);
+            Packet startResp = null;
+            long deadline = System.currentTimeMillis() + 4000;
+
+            while (System.currentTimeMillis() < deadline) {
+                Packet pkt = recv(s.sock, 500, s.sessionId); // фильтр по sessionId
+                if (pkt == null) continue;
+
+                // Пока не получили OK — игнорируем ранние DATA/ACK
+                if (pkt.type == T_DATA || pkt.type == T_ACK) continue;
+
+                if (pkt.type == T_ERR) throw new IOException(pkt.payloadText());
+
+                if (pkt.type == T_CMD_RESP) {
+                    String text = pkt.payloadText();
+                    if (text.startsWith("OK ")) { startResp = pkt; break; }
+                    throw new IOException("Bad START_DOWNLOAD response: " + text);
+                }
+            }
+
             if (startResp == null) throw new IOException("START_DOWNLOAD: no response");
-            if (startResp.type == T_ERR) throw new IOException(startResp.payloadText());
             String[] ok = startResp.payloadText().split("\\s+");
-            if (ok.length < 5 || !ok[0].equals("OK")) throw new IOException("Bad START_DOWNLOAD response: " + startResp.payloadText());
+            if (ok.length < 5) throw new IOException("Bad START_DOWNLOAD response: " + startResp.payloadText());
 
             int transferId = Integer.parseInt(ok[1]);
             long total = Long.parseLong(ok[2]);
@@ -246,7 +263,7 @@ public final class UdpFileClient {
                 long lastAckSent = 0;
 
                 while (base < totalChunks) {
-                    Packet pkt = recv(s.sock, 2000);
+                    Packet pkt = recv(s.sock, 2000, s.sessionId);
                     if (pkt == null) {
                         // если REJECT/DROP/обрыв — просто перекидываем ACK (сервер дослёт)
                         sendAck(s, transferId, received, totalChunks);
@@ -278,10 +295,10 @@ public final class UdpFileClient {
                 send(s.sock, s.server, T_FIN, s.sessionId, transferId, 0, 0, 0, new byte[0]);
 
                 Packet finResp = null;
-                long deadline = System.currentTimeMillis() + 2000;
+                long findeadline = System.currentTimeMillis() + 2000;
 
-                while (System.currentTimeMillis() < deadline) {
-                    Packet pkt = recv(s.sock, 300);
+                while (System.currentTimeMillis() < findeadline) {
+                    Packet pkt = recv(s.sock, 300, s.sessionId);
                     if (pkt == null) continue;
 
                     // Игнорируем запоздавшие DATA
@@ -457,4 +474,16 @@ public final class UdpFileClient {
         }
         return sb.toString();
     }
+
+    private static Packet recv(DatagramSocket sock, int timeoutMs, long expectedSessionId) throws IOException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            int left = (int) Math.max(1, deadline - System.currentTimeMillis());
+            Packet p = recv(sock, left);
+            if (p == null) return null;
+            if (p.sessionId == expectedSessionId) return p; // игнорируем чужие сессии
+        }
+        return null;
+    }
+
 }
