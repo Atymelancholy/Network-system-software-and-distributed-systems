@@ -1,0 +1,10 @@
+java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 time
+
+java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 echo popa
+
+java -cp target\classes org.example.TcpFileClient 127.0.0.1 50505 upload C:\Users\alsan\Downloads\mem.jpg mem.jpg
+
+
+
+
+java -cp target\classes org.example.NioTcpFileServer 50505 server_storage  
