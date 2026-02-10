@@ -1,0 +1,5 @@
+java -cp target\classes org.example.UdpFastFileClient 127.0.0.1 50506 upload C:\Users\alsan\Downloads\mem.jpg mem.jpg 1472
+
+java -cp target\classes org.example.UdpFastFileClient 127.0.0.1 50506 download mem.jpg C:\temp\mem.jpg 1472
+
+java -cp target\classes org.example.UdpFastFileServer 50506 server_storage_udp_fast
