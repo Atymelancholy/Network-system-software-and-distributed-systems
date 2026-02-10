@@ -72,6 +72,14 @@ public final class UdpFastFileClient {
         this.sock.setSoTimeout(1);
     }
 
+    private static void printSpeed(String label, long bytes, long t0Ns, long t1Ns) {
+        double sec = (t1Ns - t0Ns) / 1_000_000_000.0;
+        if (sec <= 0) sec = 1e-9;
+        double mbit = (bytes * 8.0) / 1_000_000.0;
+        double mbps = mbit / sec;
+        System.out.printf("%s speed: %.2f Mbit/s (%d bytes in %.3f s)%n", label, mbps, bytes, sec);
+    }
+
     // ====== DOWNLOAD ======
     public void download(String remoteName, File localFile, int chunk) throws Exception {
         if (chunk <= 0 || chunk > MAX_PAYLOAD) throw new IllegalArgumentException("chunk must be <= " + MAX_PAYLOAD);
@@ -92,6 +100,8 @@ public final class UdpFastFileClient {
         int usedChunk = info.chunk;
 
         System.out.println("DOWNLOAD: tid=" + tid + " bytes=" + totalBytes + " chunk=" + usedChunk + " chunks=" + totalChunks);
+
+        long t0 = System.nanoTime();
 
         BitSet received = new BitSet(totalChunks);
         long lastRx = System.currentTimeMillis();
@@ -163,7 +173,10 @@ public final class UdpFastFileClient {
         // tell server stop (DONE as client->server in our simplified scheme)
         sendPacket(T_DONE, tid, 0, 0, chunk, "OK".getBytes(StandardCharsets.UTF_8));
 
-        int finalMissing = countMissing(received, (int)((new File(localFile.getPath()).length() + chunk - 1L)/chunk));
+        long t1 = System.nanoTime();
+        printSpeed("DOWNLOAD", totalBytes, t0, t1);
+
+        int finalMissing = countMissing(received, totalChunks);
         if (finalMissing == 0) System.out.println("Saved OK (no missing chunks)");
         else System.out.println("Saved with some loss: missingChunks=" + finalMissing);
     }
@@ -175,6 +188,7 @@ public final class UdpFastFileClient {
 
         long totalBytes = localFile.length();
         String meta = remoteName + "\n" + totalBytes + "\n" + chunk + "\n";
+
         sendPacket(T_REQ_PUT, 0, 0, 0, chunk, meta.getBytes(StandardCharsets.UTF_8));
 
         Packet info = waitInfo();
@@ -185,6 +199,8 @@ public final class UdpFastFileClient {
         int usedChunk = info.chunk;
 
         System.out.println("UPLOAD: tid=" + tid + " bytes=" + totalBytes + " chunk=" + usedChunk + " chunks=" + totalChunks);
+
+        long t0 = System.nanoTime();
 
         try (RandomAccessFile raf = new RandomAccessFile(localFile, "r")) {
             // blast send without ACKs
@@ -201,6 +217,10 @@ public final class UdpFastFileClient {
 
         // tell server done
         sendPacket(T_DONE, tid, 0, totalChunks, usedChunk, "DONE".getBytes(StandardCharsets.UTF_8));
+
+        long t1 = System.nanoTime();
+        printSpeed("UPLOAD", totalBytes, t0, t1);
+
         System.out.println("UPLOAD finished (no per-packet ACKs)");
     }
 
