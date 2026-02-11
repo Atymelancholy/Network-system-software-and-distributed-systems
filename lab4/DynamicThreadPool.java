@@ -2,6 +2,7 @@ package org.example;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class DynamicThreadPool implements AutoCloseable {
 
@@ -15,6 +16,7 @@ public final class DynamicThreadPool implements AutoCloseable {
     private int totalWorkers = 0;
     private int idleWorkers = 0;
     private boolean closed = false;
+    private final AtomicInteger workerSeq = new AtomicInteger(0);
 
     public DynamicThreadPool(int nMin, int nMax, long idleTimeoutMs) {
         if (nMin <= 0) throw new IllegalArgumentException("nMin must be > 0");
@@ -44,7 +46,11 @@ public final class DynamicThreadPool implements AutoCloseable {
 
     private void startWorker(boolean core) {
         totalWorkers++;
-        Thread t = new Thread(() -> workerLoop(core), core ? "pool-core" : "pool-extra");
+
+        int id = workerSeq.incrementAndGet();
+        String name = (core ? "pool-core-" : "pool-extra-") + id;
+
+        Thread t = new Thread(() -> workerLoop(core), name);
         t.setDaemon(true);
         t.start();
     }

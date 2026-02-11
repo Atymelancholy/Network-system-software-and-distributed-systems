@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class TcpFileServerPooled {
 
@@ -26,6 +27,15 @@ public final class TcpFileServerPooled {
 
     private final int port;
     private final File baseDir;
+
+    private final AtomicInteger accepted = new AtomicInteger(0);
+    private final AtomicInteger activeClients = new AtomicInteger(0);
+    private final AtomicInteger activeUploads = new AtomicInteger(0);
+    private final AtomicInteger activeDownloads = new AtomicInteger(0);
+
+    private static void log(String msg) {
+        System.out.printf("[%s] %s%n", Thread.currentThread().getName(), msg);
+    }
 
     // защита accept (взаимное исключение)
     private final Object acceptLock = new Object();
@@ -77,28 +87,33 @@ public final class TcpFileServerPooled {
         while (running.get()) {
             try {
                 final Socket client;
-                // критическая секция: защищаем accept
+                final int id;
+
                 synchronized (acceptLock) {
                     client = server.accept();
+                    id = accepted.incrementAndGet();
                 }
 
-                pool.submit(() -> handleClient(client));
+                log("ACCEPTOR-" + idx + " accepted conn#" + id + " from " + client.getRemoteSocketAddress());
+
+                final int connId = id;
+                pool.submit(() -> handleClient(connId, client));
 
             } catch (IOException e) {
-                // server.close() при shutdown кинет SocketException — это нормально
                 if (running.get()) {
-                    // если надо — можно логировать редкие ошибки accept
-                    // System.out.println("Acceptor-" + idx + " accept error: " + e.getMessage());
+                    log("ACCEPTOR-" + idx + " accept error: " + e.getMessage());
                 }
                 return;
             } catch (Exception e) {
-                // чтобы acceptor не умирал от неожиданных исключений
                 e.printStackTrace();
             }
         }
     }
 
-    private void handleClient(Socket s) {
+    private void handleClient(int connId, Socket s) {
+        int nowActive = activeClients.incrementAndGet();
+        log("START client #" + connId + " (activeClients=" + nowActive + ")");
+
         try (Socket socket = s) {
             socket.setTcpNoDelay(true);
             socket.setKeepAlive(true);
@@ -106,14 +121,14 @@ public final class TcpFileServerPooled {
             InputStream in = new BufferedInputStream(socket.getInputStream(), IO_BUF);
             OutputStream out = new BufferedOutputStream(socket.getOutputStream(), IO_BUF);
 
-            // ВАЖНО: без приветствия (клиент ожидает ответ на команду)
-
             while (true) {
                 String line = readLine(in);
                 if (line == null) return; // EOF
 
                 line = line.trim();
                 if (line.isEmpty()) continue;
+
+                log("CMD from #" + connId + ": " + line);
 
                 String[] parts = line.split("\\s+");
                 String cmd = parts[0].toUpperCase(Locale.ROOT);
@@ -133,8 +148,8 @@ public final class TcpFileServerPooled {
                         out.flush();
                         return;
                     }
-                    case "UPLOAD" -> handleUpload(parts, in, out);
-                    case "DOWNLOAD" -> handleDownload(parts, out);
+                    case "UPLOAD" -> handleUpload(connId, parts, in, out);
+                    case "DOWNLOAD" -> handleDownload(connId, parts, out);
                     default -> {
                         writeLine(out, "ERR Unknown command");
                         out.flush();
@@ -142,118 +157,148 @@ public final class TcpFileServerPooled {
                 }
             }
         } catch (IOException ignored) {
-            // клиент оборвал соединение — норм
+            log("IO disconnect client #" + connId);
         } catch (Exception e) {
+            log("ERROR client #" + connId + ": " + e.getMessage());
             e.printStackTrace();
+        } finally {
+            int left = activeClients.decrementAndGet();
+            log("END client #" + connId + " (activeClients=" + left + ")");
         }
     }
 
     // UPLOAD <name> <totalSize> <offset>
-    private void handleUpload(String[] parts, InputStream in, OutputStream out) throws IOException {
-        if (parts.length < 4) {
-            writeLine(out, "ERR Usage: UPLOAD <name> <size> <offset>");
-            out.flush();
-            return;
-        }
+    private void handleUpload(int connId, String[] parts, InputStream in, OutputStream out) throws IOException {
+        int upNow = activeUploads.incrementAndGet();
+        log("UPLOAD start conn#" + connId + " (activeUploads=" + upNow + ")");
 
-        String name = sanitizeFileName(parts[1]);
-        long totalSize = parseLong(parts[2], -1);
-        long offset = parseLong(parts[3], -1);
-
-        if (name == null || totalSize < 0 || offset < 0 || offset > totalSize) {
-            writeLine(out, "ERR Bad args");
-            out.flush();
-            return;
-        }
-
-        File target = new File(baseDir, name);
-        ensureDir(target.getParentFile());
-
-        long current = target.exists() ? target.length() : 0L;
-        if (offset != current) {
-            // клиент парсит "Server has X"
-            writeLine(out, "ERR Offset mismatch. Server has " + current);
-            out.flush();
-            return;
-        }
-
-        long remaining = totalSize - offset;
-
-        // handshake: OK -> клиент шлёт remaining байт
-        writeLine(out, "OK");
-        out.flush();
-
-        try (RandomAccessFile raf = new RandomAccessFile(target, "rw")) {
-            raf.seek(offset);
-
-            byte[] buf = new byte[IO_BUF];
-            long left = remaining;
-
-            while (left > 0) {
-                int need = (int) Math.min(buf.length, left);
-                int n = readFully(in, buf, 0, need);
-                if (n == -1) throw new EOFException("Client EOF during upload, left=" + left);
-                raf.write(buf, 0, n);
-                left -= n;
+        try {
+            if (parts.length < 4) {
+                writeLine(out, "ERR Usage: UPLOAD <name> <size> <offset>");
+                out.flush();
+                return;
             }
-        }
 
-        writeLine(out, "OK DONE " + totalSize);
-        out.flush();
+            String name = sanitizeFileName(parts[1]);
+            long totalSize = parseLong(parts[2], -1);
+            long offset = parseLong(parts[3], -1);
+
+            if (name == null || totalSize < 0 || offset < 0 || offset > totalSize) {
+                writeLine(out, "ERR Bad args");
+                out.flush();
+                return;
+            }
+
+            File target = new File(baseDir, name);
+            ensureDir(target.getParentFile());
+
+            long current = target.exists() ? target.length() : 0L;
+            if (offset != current) {
+                writeLine(out, "ERR Offset mismatch. Server has " + current);
+                out.flush();
+                log("UPLOAD reject conn#" + connId + " offset=" + offset + " serverHas=" + current);
+                return;
+            }
+
+            long remaining = totalSize - offset;
+
+            writeLine(out, "OK");
+            out.flush();
+
+            long startNs = System.nanoTime();
+
+            try (RandomAccessFile raf = new RandomAccessFile(target, "rw")) {
+                raf.seek(offset);
+
+                byte[] buf = new byte[IO_BUF];
+                long left = remaining;
+
+                while (left > 0) {
+                    int need = (int) Math.min(buf.length, left);
+                    int n = readFully(in, buf, 0, need);
+                    if (n == -1) throw new EOFException("Client EOF during upload, left=" + left);
+                    raf.write(buf, 0, n);
+                    left -= n;
+                }
+            }
+
+            double sec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+            log("UPLOAD done conn#" + connId + " bytes=" + remaining + " time=" + String.format(Locale.ROOT, "%.3f", sec) + "s");
+
+            writeLine(out, "OK DONE " + totalSize);
+            out.flush();
+        } finally {
+            int left = activeUploads.decrementAndGet();
+            log("UPLOAD end conn#" + connId + " (activeUploads=" + left + ")");
+        }
     }
 
     // DOWNLOAD <name> <offset>
-    private void handleDownload(String[] parts, OutputStream out) throws IOException {
-        if (parts.length < 3) {
-            writeLine(out, "ERR Usage: DOWNLOAD <name> <offset>");
-            out.flush();
-            return;
-        }
+    private void handleDownload(int connId, String[] parts, OutputStream out) throws IOException {
+        int dlNow = activeDownloads.incrementAndGet();
+        log("DOWNLOAD start conn#" + connId + " (activeDownloads=" + dlNow + ")");
 
-        String name = sanitizeFileName(parts[1]);
-        long offset = parseLong(parts[2], -1);
-
-        if (name == null || offset < 0) {
-            writeLine(out, "ERR Bad args");
-            out.flush();
-            return;
-        }
-
-        File source = new File(baseDir, name);
-        if (!source.exists() || !source.isFile()) {
-            writeLine(out, "ERR No such file");
-            out.flush();
-            return;
-        }
-
-        long total = source.length();
-        if (offset > total) {
-            writeLine(out, "ERR Offset too big");
-            out.flush();
-            return;
-        }
-
-        writeLine(out, "OK " + total);
-        out.flush();
-
-        long remaining = total - offset;
-
-        try (RandomAccessFile raf = new RandomAccessFile(source, "r")) {
-            raf.seek(offset);
-
-            byte[] buf = new byte[IO_BUF];
-            long left = remaining;
-
-            while (left > 0) {
-                int r = raf.read(buf, 0, (int) Math.min(buf.length, left));
-                if (r == -1) break;
-                out.write(buf, 0, r);
-                left -= r;
+        try {
+            if (parts.length < 3) {
+                writeLine(out, "ERR Usage: DOWNLOAD <name> <offset>");
+                out.flush();
+                return;
             }
-        }
 
-        writeLine(out, "OK DONE " + total);
-        out.flush();
+            String name = sanitizeFileName(parts[1]);
+            long offset = parseLong(parts[2], -1);
+
+            if (name == null || offset < 0) {
+                writeLine(out, "ERR Bad args");
+                out.flush();
+                return;
+            }
+
+            File source = new File(baseDir, name);
+            if (!source.exists() || !source.isFile()) {
+                writeLine(out, "ERR No such file");
+                out.flush();
+                return;
+            }
+
+            long total = source.length();
+            if (offset > total) {
+                writeLine(out, "ERR Offset too big");
+                out.flush();
+                return;
+            }
+
+            writeLine(out, "OK " + total);
+            out.flush();
+
+            long remaining = total - offset;
+            long startNs = System.nanoTime();
+
+            try (RandomAccessFile raf = new RandomAccessFile(source, "r")) {
+                raf.seek(offset);
+
+                byte[] buf = new byte[IO_BUF];
+                long left = remaining;
+
+                while (left > 0) {
+                    int r = raf.read(buf, 0, (int) Math.min(buf.length, left));
+                    if (r == -1) break;
+                    out.write(buf, 0, r);
+                    left -= r;
+                }
+            }
+
+            out.flush();
+
+            double sec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+            log("DOWNLOAD sent conn#" + connId + " bytes=" + remaining + " time=" + String.format(Locale.ROOT, "%.3f", sec) + "s");
+
+            writeLine(out, "OK DONE " + total);
+            out.flush();
+        } finally {
+            int left = activeDownloads.decrementAndGet();
+            log("DOWNLOAD end conn#" + connId + " (activeDownloads=" + left + ")");
+        }
     }
 
     // ===== line I/O =====
