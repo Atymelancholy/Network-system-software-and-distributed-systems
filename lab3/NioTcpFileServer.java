@@ -185,15 +185,22 @@ public final class NioTcpFileServer {
         if (budget > 0 && c.mode == Mode.SEND_FILE && c.outQueue.isEmpty()) {
             sendFileChunk(ch, c, budget);
         }
+
+        if (c.closeAfterWrite && c.outQueue.isEmpty() && c.mode == Mode.CMD) {
+            closeKey(key, "BYE");
+        }
     }
 
     private void sendFileChunk(SocketChannel ch, Client c, int budget) throws IOException {
         if (c.sendRemaining <= 0) { finishSend(c); return; }
 
-        if (c.fileOutBuf == null) c.fileOutBuf = ByteBuffer.allocate(CHUNK);
+        if (c.fileOutBuf == null) {
+            c.fileOutBuf = ByteBuffer.allocate(CHUNK);
+            c.fileOutBuf.limit(0); // ✅ делаем буфер "пустым", чтобы hasRemaining() стало false
+        }
 
         // Если буфер пустой — подгружаем следующую порцию из файла
-        if (!c.fileOutBuf.hasRemaining()) {
+        if (c.fileOutBuf.remaining() == 0) {
             c.fileOutBuf.clear();
             int toRead = (int) Math.min(c.fileOutBuf.capacity(), Math.min((long) budget, c.sendRemaining));
             c.fileOutBuf.limit(toRead);
