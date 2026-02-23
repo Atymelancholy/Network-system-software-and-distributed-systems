@@ -10,12 +10,11 @@ import java.net.InetSocketAddress;
 public final class TcpFileClient {
 
     private static final long NO_PROGRESS_LIMIT_MS = 60_000;
-    // обнаружение в разумное время (30 сек)
-    private static final long AUTO_RECOVERY_WINDOW_MS = 90_000;   // автопопытки ДО сообщения (например 90 сек)
+    private static final long AUTO_RECOVERY_WINDOW_MS = 90_000;
     private static final long RETRY_DELAY_MS = 5_000;
     private static final int CONNECT_TIMEOUT_MS = 30_000;
     private static final int READ_TIMEOUT_MS = 30_000;
-// пауза между переподключениями
+
 private static final int MAX_LINE = 8 * 1024;
 
     public static void main(String[] args) throws Exception {
@@ -50,6 +49,7 @@ private static final int MAX_LINE = 8 * 1024;
             }
         }
     }
+
     private static void printUsageAndExit() {
         System.out.println("""
         Usage:
@@ -65,8 +65,9 @@ private static final int MAX_LINE = 8 * 1024;
             java TcpFileClient 192.168.1.10 50505 upload ./big.bin big.bin
             java TcpFileClient 192.168.1.10 50505 download big.bin ./big.bin
         """);
-        System.exit(1);   // ← ВОТ ЭТА СТРОКА ГЛАВНАЯ
+        System.exit(1);
     }
+
     private static void runSimple(String host, int port, String command) {
         try (Session s = Session.connect(host, port)) {
             String resp = s.sendLineAndReadLine(command);
@@ -99,15 +100,18 @@ private static final int MAX_LINE = 8 * 1024;
                 if (resp.startsWith("OK")) {
                     deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS;
 
+                    long startNs = System.nanoTime();
+
                     long sent = sendFileFromOffset(s.out, localFile, offset);
                     s.out.flush();
 
-                    offset += sent; // ✅ ВАЖНО: учитываем отправленное (для корректного resume после обрыва)
-
                     String finalResp = s.readLine();
+                    long endNs = System.nanoTime();
+
                     if (finalResp == null) throw new IOException("Disconnected while waiting server confirmation");
 
                     if (finalResp.startsWith("OK DONE")) {
+                        printBitrate("UPLOAD real bitrate", sent, startNs, endNs);
                         System.out.println("UPLOAD finished. Sent bytes: " + sent);
                         return;
                     }
@@ -168,34 +172,37 @@ private static final int MAX_LINE = 8 * 1024;
                 if (resp == null) throw new IOException("Disconnected during handshake");
                 if (!resp.startsWith("OK")) throw new IOException("Server error: " + resp);
 
-                deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS; // ✅ прогресс есть → окно автопочинки продлеваем
+                deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS;
 
                 long total = Long.parseLong(resp.split("\\s+")[1]);
                 if (offset > total) throw new IOException("Local file bigger than server file; delete local and retry");
 
                 long toRead = total - offset;
+
+                long startNs = System.nanoTime();
+
                 long got = receiveToFileWithProgress(s, localFile, offset, toRead);
 
                 if (got > 0) {
-                    deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS; // ✅
+                    deadline = System.currentTimeMillis() + AUTO_RECOVERY_WINDOW_MS;
                 }
 
                 if (got == toRead) {
-                    // ✅ дочитали байты — теперь ждём подтверждение конца
                     String done = s.readLine();
+                    long endNs = System.nanoTime();
+
                     if (done == null || !done.startsWith("OK DONE")) {
                         throw new IOException("Server did not confirm DONE: " + done);
                     }
 
+                    printBitrate("DOWNLOAD real bitrate", got, startNs, endNs);
                     System.out.println("DOWNLOAD finished. Got bytes: " + got + " / " + toRead);
                     return;
                 }
 
-
-                // если не дочитали — считаем это проблемой канала
                 throw new IOException("Disconnected during download stream");
 
-            } catch (SocketTimeoutException | SocketException e) {
+                } catch (SocketTimeoutException | SocketException e) {
                 if (System.currentTimeMillis() < deadline) {
                     sleepSilently(RETRY_DELAY_MS);
                     continue;
@@ -218,7 +225,6 @@ private static final int MAX_LINE = 8 * 1024;
     }
 
     private static long receiveToFileWithProgress(Session s, File file, long offset, long toRead) throws IOException {
-        long startNs = System.nanoTime();
         long lastProgress = System.currentTimeMillis();
 
         try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
@@ -239,27 +245,24 @@ private static final int MAX_LINE = 8 * 1024;
                     totalRead += n;
                     lastProgress = System.currentTimeMillis();
                 } catch (SocketTimeoutException te) {
-                    // просто нет данных сейчас — проверяем, сколько уже ждём без прогресса
+
                     long stall = System.currentTimeMillis() - lastProgress;
                     if (stall >= NO_PROGRESS_LIMIT_MS) {
                         System.out.println("DOWNLOAD: no data for " + stall + " ms -> reconnect/resume");
                         throw te;
                     }
-                    // иначе ждём дальше
                 }
             }
 
-            printBitrate("DOWNLOAD bitrate", totalRead, startNs);
-            return totalRead;
+           return totalRead;
         }
     }
 
-    // ===== transfer helpers =====
     private static void sleepSilently(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
+
     private static long sendFileFromOffset(OutputStream out, File file, long offset) throws IOException {
-        long startNs = System.nanoTime();
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
             raf.seek(offset);
             byte[] buf = new byte[64 * 1024];
@@ -270,17 +273,18 @@ private static final int MAX_LINE = 8 * 1024;
                 out.write(buf, 0, n);
                 totalSent += n;
             }
-            printBitrate("UPLOAD bitrate", totalSent, startNs);
             return totalSent;
         }
     }
-    private static void printBitrate(String label, long bytes, long startNs) {
-        double sec = (System.nanoTime() - startNs) / 1_000_000_000.0;
+
+    private static void printBitrate(String label, long bytes, long startNs, long endNs) {
+        double sec = (endNs - startNs) / 1_000_000_000.0;
         if (sec <= 0.000001) return;
-        double mbit = (bytes * 8.0) / 1_000_000.0;
+        double mbit = (bytes * 8.0) / (1024.0*1024.0);
         System.out.printf("%s: %.2f Mbit/s (%d bytes in %.3f s)%n", label, mbit / sec, bytes, sec);
     }
-    private static Long parseServerHas(String resp) {
+
+   private static Long parseServerHas(String resp) {
         String marker = "Server has ";
         int i = resp.indexOf(marker);
         if (i < 0) return null;
@@ -292,6 +296,7 @@ private static final int MAX_LINE = 8 * 1024;
         try { return Long.parseLong(tail); }
         catch (Exception e) { return null; }
     }
+
     private static String joinFrom(String[] args, int idx) {
         if (idx >= args.length) return "";
         StringBuilder sb = new StringBuilder();
@@ -301,6 +306,7 @@ private static final int MAX_LINE = 8 * 1024;
         }
         return sb.toString();
     }
+
     static String readLine(InputStream in) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream(128);
         while (true) {
@@ -312,12 +318,13 @@ private static final int MAX_LINE = 8 * 1024;
         }
         return buf.toString(StandardCharsets.UTF_8);
     }
+
     static void sendLine(OutputStream out, String line) throws IOException {
         out.write(line.getBytes(StandardCharsets.UTF_8));
         out.write('\n');
         out.flush();
     }
-    // ===== Session wrapper =====
+
     private static final class Session implements Closeable {
         final Socket socket;
         final InputStream in;
@@ -334,8 +341,8 @@ private static final int MAX_LINE = 8 * 1024;
             s.setKeepAlive(true);
             s.setTcpNoDelay(true);
 
-            s.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS); // ✅ отдельный таймаут на connect
-            s.setSoTimeout(READ_TIMEOUT_MS);                                  // ✅ отдельный таймаут на read
+            s.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+            s.setSoTimeout(READ_TIMEOUT_MS);
             return new Session(s);
         }
 

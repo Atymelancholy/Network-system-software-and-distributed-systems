@@ -8,45 +8,34 @@ import java.util.*;
 
 public final class UdpFastFileServer {
 
-    // ====== TUNING ======
     private static final int PORT_DEFAULT = 50506;
     private static final String DIR_DEFAULT = "server_storage_udp_fast";
-
-    // Под hotspot лучше ставить MTU-safe payload ~1472
-    private static final int MAX_PAYLOAD = 1472;
-
-    // Сколько пакетов шлём подряд перед тем как "быстро глянуть" входящие
-    private static final int BURST = 2048;
-
-    // Сколько миллисекунд считаем "тишиной", чтобы закончить фазу blast
-    private static final int IDLE_FINISH_MS = 120;
-
-    // Ремонт-раундов (NACK -> resend)
-    private static final int REPAIR_ROUNDS = 3;
-
-    // Максимум ranges в одном NACK (каждый range = 8 байт: start(int)+len(int))
-    private static final int MAX_NACK_RANGES = 2048;
-
-    // Socket buffers (очень влияет на скорость и потери)
+    private static final int MTU = 1500;
+    private static final int IP_HDR = 20;
+    private static final int UDP_HDR = 8;
+    private static final int UDP_PAYLOAD_MAX = MTU - IP_HDR - UDP_HDR;
+    private static final int HDR = 20;
+    private static final int MAX_PAYLOAD = UDP_PAYLOAD_MAX - HDR;
+    private static final int WINDOW = 512;
+    private static final int RTO_MS = 80;
+    private static final int MAX_RETRIES = 25;
+    private static final int ACK_EVERY_PKTS = 64;
+    private static final int ACK_IDLE_MS = 15;
+    private static final int DEAD_MS = 5000;
+    private static final int MAX_ACK_PACKET = 1200;
+    private static final int ACK_OVERHEAD = HDR + 4;
+    private static final int MAX_ACK_RANGES = Math.max(0, (MAX_ACK_PACKET - ACK_OVERHEAD) / 8);
     private static final int SO_RCVBUF = 8 * 1024 * 1024;
     private static final int SO_SNDBUF = 8 * 1024 * 1024;
-
-    // ====== PROTOCOL ======
-    private static final short MAGIC = (short) 0x5546; // 'U''F'
-    private static final byte VER = 1;
-
-    // types
-    private static final byte T_REQ_GET  = 1; // client->server: "GET name\nchunk\n"
-    private static final byte T_REQ_PUT  = 2; // client->server: "PUT name\nsize\nchunk\n"
-    private static final byte T_INFO     = 3; // server->client: meta for transfer
-    private static final byte T_DATA     = 4; // data packets
-    private static final byte T_NACK     = 5; // receiver->sender: missing ranges
-    private static final byte T_DONE     = 6; // sender->receiver: "DONE"
-    private static final byte T_ERR      = 7; // error text
-
-    // header:
-    // magic(2) ver(1) type(1) transferId(4) seq(4) totalChunks(4) chunk(2) payloadLen(2) = 20 bytes
-    private static final int HDR = 20;
+    private static final short MAGIC = (short) 0x5446;
+    private static final byte VER = 2;
+    private static final byte T_REQ_GET  = 1;
+    private static final byte T_REQ_PUT  = 2;
+    private static final byte T_INFO     = 3;
+    private static final byte T_DATA     = 4;
+    private static final byte T_DONE     = 6;
+    private static final byte T_ERR      = 7;
+    private static final byte T_ACK      = 8;
 
     private static final class Packet {
         final byte type;
@@ -70,9 +59,8 @@ public final class UdpFastFileServer {
         }
     }
 
-    // ====== STATE (single transfer at a time; single thread) ======
     private static final class Transfer {
-        final boolean upload;              // true if client->server (PUT)
+        final boolean upload;
         final SocketAddress peer;
         final int transferId;
         final File file;
@@ -81,10 +69,17 @@ public final class UdpFastFileServer {
         final int chunk;
         final int totalChunks;
 
-        final BitSet received;             // which chunks receiver has (for upload: server receives; for download: client receives; but server needs it when it is receiver in upload)
-        final BitSet sentOrRepaired;       // for download sender bookkeeping (optional)
+        final BitSet received;
+        int rxSinceAck = 0;
+        long lastAckSentMs = 0;
 
-        int nextToSend = 0;                // download: next seq to blast
+        final BitSet acked;
+        int base = 0;
+        int nextToSend = 0;
+        final long[] lastSendMs;
+        final byte[] retries;
+        boolean doneSent = false;
+
         long lastRxMs = System.currentTimeMillis();
 
         Transfer(boolean upload, SocketAddress peer, int transferId, File file, RandomAccessFile raf,
@@ -97,13 +92,25 @@ public final class UdpFastFileServer {
             this.totalBytes = totalBytes;
             this.chunk = chunk;
             this.totalChunks = totalChunks;
+
             this.received = new BitSet(totalChunks);
-            this.sentOrRepaired = new BitSet(totalChunks);
+            this.acked = new BitSet(totalChunks);
+
+            this.lastSendMs = new long[totalChunks];
+            this.retries = new byte[totalChunks];
         }
 
         void touchRx() { lastRxMs = System.currentTimeMillis(); }
 
         void closeQuiet() { try { raf.close(); } catch (Exception ignored) {} }
+
+        boolean allReceived() {
+            return received.nextClearBit(0) >= totalChunks;
+        }
+
+        boolean allAcked() {
+            return acked.nextClearBit(0) >= totalChunks;
+        }
     }
 
     private final File baseDir;
@@ -120,27 +127,22 @@ public final class UdpFastFileServer {
         this.sock.setReceiveBufferSize(SO_RCVBUF);
         this.sock.setSendBufferSize(SO_SNDBUF);
 
-        // Очень важно: маленький timeout, чтобы можно было interleave send/recv в одном потоке
-        this.sock.setSoTimeout(1);
+        this.sock.setSoTimeout(2);
     }
 
     public void run() throws Exception {
-        System.out.println("UDP FAST server on port " + sock.getLocalPort());
+        System.out.println("UDP FAST+ACK server on port " + sock.getLocalPort());
         System.out.println("Storage: " + baseDir.getAbsolutePath());
-        System.out.println("MAX_PAYLOAD=" + MAX_PAYLOAD + " BURST=" + BURST);
+        System.out.println("MAX_PAYLOAD=" + MAX_PAYLOAD + " WINDOW=" + WINDOW + " RTO_MS=" + RTO_MS);
 
         byte[] buf = new byte[65507];
         DatagramPacket dp = new DatagramPacket(buf, buf.length);
 
         while (true) {
-            // 1) если есть активный download — blast порциями
-            if (current != null && !current.upload) {
-                blastSomeDownload(current);
-                // если давно ничего не приходило (нет NACK) — возможно клиент уже доволен
-                // но всё равно ждём NACK/DONE чуть-чуть
+            if (current != null) {
+                serviceTransfer(current);
             }
 
-            // 2) читаем входящие пакеты (короткий poll)
             Packet p = recvPacket(dp);
             if (p == null) continue;
 
@@ -150,16 +152,44 @@ public final class UdpFastFileServer {
                 case T_REQ_GET -> handleGet(peer, p);
                 case T_REQ_PUT -> handlePut(peer, p);
                 case T_DATA    -> handleData(peer, p);
-                case T_NACK    -> handleNack(peer, p);
+                case T_ACK     -> handleAck(peer, p);
                 case T_DONE    -> handleDone(peer, p);
-                default -> { /* ignore */ }
+                default -> {}
             }
         }
     }
 
-    // ===== GET (download) =====
+    private void serviceTransfer(Transfer t) throws Exception {
+        long now = System.currentTimeMillis();
+
+        if (now - t.lastRxMs > DEAD_MS) {
+            System.out.println("Transfer timeout / connection lost, tid=" + t.transferId);
+            t.closeQuiet();
+            current = null;
+            return;
+        }
+
+        if (!t.upload) {
+            sendNewWithinWindow(t, now);
+            resendTimeouts(t, now);
+
+            if (t.allAcked() && !t.doneSent) {
+                sendPacket(t.peer, T_DONE, t.transferId, 0, t.totalChunks, t.chunk,
+                        "DONE".getBytes(StandardCharsets.UTF_8));
+                t.doneSent = true;
+            }
+        } else {
+            maybeSendAck(t, now);
+
+            if (t.allReceived() && !t.doneSent) {
+                sendPacket(t.peer, T_DONE, t.transferId, 0, t.totalChunks, t.chunk,
+                        "DONE".getBytes(StandardCharsets.UTF_8));
+                t.doneSent = true;
+            }
+        }
+    }
+
     private void handleGet(SocketAddress peer, Packet req) throws Exception {
-        // формат payload: "name\nchunk\n"
         String[] lines = req.payloadText().split("\n");
         if (lines.length < 2) {
             sendErr(peer, 0, "Bad GET");
@@ -178,6 +208,11 @@ public final class UdpFastFileServer {
             return;
         }
 
+        if (current != null) {
+            sendErr(peer, 0, "Server busy (single transfer)");
+            return;
+        }
+
         long total = f.length();
         int totalChunks = (int) ((total + chunk - 1L) / chunk);
         int tid = rnd.nextInt();
@@ -186,89 +221,16 @@ public final class UdpFastFileServer {
         Transfer t = new Transfer(false, peer, tid, f, raf, total, chunk, totalChunks);
         current = t;
 
-        // INFO: payload = "OK name size\n"
         String info = "OK " + name + " " + total + "\n";
         sendPacket(peer, T_INFO, tid, 0, totalChunks, chunk, info.getBytes(StandardCharsets.UTF_8));
 
-        // начинаем blast сразу
+        t.base = 0;
         t.nextToSend = 0;
+        t.doneSent = false;
         t.touchRx();
     }
 
-    private void blastSomeDownload(Transfer t) throws Exception {
-        int sent = 0;
-        while (sent < BURST && t.nextToSend < t.totalChunks) {
-            int seq = t.nextToSend++;
-            // читаем кусок
-            long off = (long) seq * t.chunk;
-            int len = (int) Math.min(t.chunk, t.totalBytes - off);
-            byte[] data = new byte[len];
-            t.raf.seek(off);
-            t.raf.readFully(data);
-
-            sendPacket(t.peer, T_DATA, t.transferId, seq, t.totalChunks, t.chunk, data);
-            sent++;
-        }
-
-        // если все отправили — ждём NACK/или DONE. Если тишина — можно доп. DONE.
-        long now = System.currentTimeMillis();
-        if (t.nextToSend >= t.totalChunks && (now - t.lastRxMs) > IDLE_FINISH_MS) {
-            // "подтолкнём" клиента завершиться
-            sendPacket(t.peer, T_DONE, t.transferId, 0, t.totalChunks, t.chunk, "DONE".getBytes(StandardCharsets.UTF_8));
-            // не закрываем — вдруг придёт NACK на ремонт
-            t.lastRxMs = now;
-        }
-    }
-
-    private void handleNack(SocketAddress peer, Packet nack) throws Exception {
-        Transfer t = current;
-        if (t == null) return;
-        if (!Objects.equals(t.peer, peer)) return;
-        if (t.transferId != nack.transferId) return;
-
-        t.touchRx();
-
-        // payload = ranges: [start(int), len(int)] * N
-        ByteBuffer bb = ByteBuffer.wrap(nack.payload);
-        int ranges = Math.min(bb.remaining() / 8, MAX_NACK_RANGES);
-
-        int resent = 0;
-        for (int i = 0; i < ranges; i++) {
-            int start = bb.getInt();
-            int len = bb.getInt();
-            if (len <= 0) continue;
-
-            int end = Math.min(t.totalChunks, start + len);
-            for (int seq = Math.max(0, start); seq < end; seq++) {
-                // resend missing
-                long off = (long) seq * t.chunk;
-                int plen = (int) Math.min(t.chunk, t.totalBytes - off);
-                byte[] data = new byte[plen];
-                t.raf.seek(off);
-                t.raf.readFully(data);
-                sendPacket(t.peer, T_DATA, t.transferId, seq, t.totalChunks, t.chunk, data);
-                resent++;
-            }
-        }
-
-        // После дозапросов — снова DONE (пусть клиент решит, всё ли ок)
-        sendPacket(t.peer, T_DONE, t.transferId, 0, t.totalChunks, t.chunk, "DONE".getBytes(StandardCharsets.UTF_8));
-    }
-
-    private void handleDone(SocketAddress peer, Packet done) throws Exception {
-        Transfer t = current;
-        if (t == null) return;
-        if (!Objects.equals(t.peer, peer)) return;
-        if (t.transferId != done.transferId) return;
-
-        // Клиент сказал "хватит"
-        t.closeQuiet();
-        current = null;
-    }
-
-    // ===== PUT (upload) =====
     private void handlePut(SocketAddress peer, Packet req) throws Exception {
-        // payload: "name\nsize\nchunk\n"
         String[] lines = req.payloadText().split("\n");
         if (lines.length < 3) {
             sendErr(peer, 0, "Bad PUT");
@@ -282,11 +244,17 @@ public final class UdpFastFileServer {
             return;
         }
 
+        if (current != null) {
+            sendErr(peer, 0, "Server busy (single transfer)");
+            return;
+        }
+
         File f = new File(baseDir, name);
         ensureDir(f.getParentFile());
 
         int totalChunks = (int) ((total + chunk - 1L) / chunk);
         int tid = rnd.nextInt();
+
         RandomAccessFile raf = new RandomAccessFile(f, "rw");
         raf.setLength(total);
 
@@ -295,42 +263,187 @@ public final class UdpFastFileServer {
 
         String info = "OK " + name + " " + total + "\n";
         sendPacket(peer, T_INFO, tid, 0, totalChunks, chunk, info.getBytes(StandardCharsets.UTF_8));
+
+        t.doneSent = false;
+        t.lastAckSentMs = 0;
+        t.rxSinceAck = 0;
         t.touchRx();
     }
 
     private void handleData(SocketAddress peer, Packet data) throws Exception {
         Transfer t = current;
         if (t == null) return;
-        if (!t.upload) return; // server receives DATA only for upload
+        if (!t.upload) return;
         if (!Objects.equals(t.peer, peer)) return;
         if (t.transferId != data.transferId) return;
 
         t.touchRx();
+
         int seq = data.seq;
         if (seq < 0 || seq >= t.totalChunks) return;
 
         if (!t.received.get(seq)) {
             long off = (long) seq * t.chunk;
             int expected = (int) Math.min(t.chunk, t.totalBytes - off);
+
             if (data.payload.length != expected) return;
 
             t.raf.seek(off);
             t.raf.write(data.payload);
             t.received.set(seq);
+            t.rxSinceAck++;
         }
 
-        // НИКАКИХ ACK на каждый пакет.
-        // Только если клиент сам запросит ремонт — тогда NACK’и будет слать сервер (но мы здесь держим максимально просто).
-        // Клиент сам завершит, когда решит.
+        long now = System.currentTimeMillis();
+        if (t.rxSinceAck >= ACK_EVERY_PKTS) {
+            sendAckPacket(t, now);
+        }
     }
 
-    // ====== IO ======
+    private void handleAck(SocketAddress peer, Packet ack) throws Exception {
+        Transfer t = current;
+        if (t == null) return;
+        if (t.upload) return;
+        if (!Objects.equals(t.peer, peer)) return;
+        if (t.transferId != ack.transferId) return;
+
+        t.touchRx();
+
+        ByteBuffer bb = ByteBuffer.wrap(ack.payload);
+        if (bb.remaining() < 4) return;
+
+        int base = bb.getInt();
+        if (base < 0) base = 0;
+        if (base > t.totalChunks) base = t.totalChunks;
+
+        if (base > 0) t.acked.set(0, base);
+
+        int ranges = Math.min(bb.remaining() / 8, MAX_ACK_RANGES);
+        for (int i = 0; i < ranges; i++) {
+            int start = bb.getInt();
+            int len = bb.getInt();
+            if (len <= 0) continue;
+            int end = Math.min(t.totalChunks, start + len);
+            if (start < 0) start = 0;
+            if (start < end) t.acked.set(start, end);
+        }
+
+        int newBase = t.acked.nextClearBit(t.base);
+        if (newBase < 0) newBase = t.totalChunks;
+        t.base = Math.min(newBase, t.totalChunks);
+
+        if (t.nextToSend < t.base) t.nextToSend = t.base;
+    }
+
+    private void handleDone(SocketAddress peer, Packet done) throws Exception {
+        Transfer t = current;
+        if (t == null) return;
+        if (!Objects.equals(t.peer, peer)) return;
+        if (t.transferId != done.transferId) return;
+        t.closeQuiet();
+        current = null;
+    }
+
+    private void sendNewWithinWindow(Transfer t, long now) throws Exception {
+        int limit = Math.min(t.totalChunks, t.base + WINDOW);
+
+        while (t.nextToSend < limit) {
+            int seq = t.nextToSend++;
+
+            if (t.acked.get(seq)) continue;
+
+            sendDataChunk(t, seq, now);
+        }
+    }
+
+    private void resendTimeouts(Transfer t, long now) throws Exception {
+        int limit = Math.min(t.totalChunks, t.base + WINDOW);
+
+        for (int seq = t.base; seq < limit; seq++) {
+            if (t.acked.get(seq)) continue;
+
+            long last = t.lastSendMs[seq];
+            if (last == 0) continue;
+
+            if (now - last >= RTO_MS) {
+                int r = Byte.toUnsignedInt(t.retries[seq]);
+                if (r >= MAX_RETRIES) {
+                    System.out.println("Max retries reached, tid=" + t.transferId + " seq=" + seq);
+                    sendErr(t.peer, t.transferId, "Timeout / peer lost");
+                    t.closeQuiet();
+                    current = null;
+                    return;
+                }
+                t.retries[seq] = (byte) (r + 1);
+                sendDataChunk(t, seq, now);
+            }
+        }
+    }
+
+    private void sendDataChunk(Transfer t, int seq, long now) throws Exception {
+        long off = (long) seq * t.chunk;
+        int len = (int) Math.min(t.chunk, t.totalBytes - off);
+
+        byte[] data = new byte[len];
+        t.raf.seek(off);
+        t.raf.readFully(data);
+
+        sendPacket(t.peer, T_DATA, t.transferId, seq, t.totalChunks, t.chunk, data);
+        t.lastSendMs[seq] = now;
+    }
+
+    private void maybeSendAck(Transfer t, long now) throws IOException {
+        if (!t.upload) return;
+
+        if (t.rxSinceAck > 0 && (now - t.lastAckSentMs) >= ACK_IDLE_MS) {
+            sendAckPacket(t, now);
+        }
+    }
+
+    private void sendAckPacket(Transfer t, long now) throws IOException {
+
+        int base = t.received.nextClearBit(0);
+        if (base < 0) base = t.totalChunks;
+        if (base > t.totalChunks) base = t.totalChunks;
+
+        byte[] sackRanges = buildReceivedSackRanges(t.received, base, t.totalChunks, MAX_ACK_RANGES);
+
+        ByteBuffer bb = ByteBuffer.allocate(4 + sackRanges.length);
+        bb.putInt(base);
+        bb.put(sackRanges);
+
+        sendPacket(t.peer, T_ACK, t.transferId, 0, t.totalChunks, t.chunk, Arrays.copyOf(bb.array(), bb.position()));
+
+        t.lastAckSentMs = now;
+        t.rxSinceAck = 0;
+    }
+
+    private static byte[] buildReceivedSackRanges(BitSet received, int from, int totalChunks, int maxRanges) {
+        ByteBuffer bb = ByteBuffer.allocate(maxRanges * 8);
+        int ranges = 0;
+
+        int i = received.nextSetBit(from);
+        while (i >= 0 && i < totalChunks && ranges < maxRanges) {
+            int start = i;
+            int end = i + 1;
+            while (end < totalChunks && received.get(end)) end++;
+
+            bb.putInt(start);
+            bb.putInt(end - start);
+            ranges++;
+
+            i = received.nextSetBit(end);
+        }
+        return Arrays.copyOf(bb.array(), bb.position());
+    }
+
     private Packet recvPacket(DatagramPacket dp) throws IOException {
         try {
             sock.receive(dp);
         } catch (SocketTimeoutException e) {
             return null;
         }
+
         ByteBuffer bb = ByteBuffer.wrap(dp.getData(), dp.getOffset(), dp.getLength());
         if (bb.remaining() < HDR) return null;
 
@@ -373,7 +486,6 @@ public final class UdpFastFileServer {
         sock.send(dp);
     }
 
-    // ====== utils ======
     private static void ensureDir(File dir) throws IOException {
         if (dir == null) return;
         if (!dir.exists() && !dir.mkdirs()) throw new IOException("Cannot create dir: " + dir);

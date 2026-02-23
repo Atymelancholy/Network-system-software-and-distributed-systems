@@ -47,7 +47,7 @@ public final class TcpFileServer {
         OutputStream rawOut = new BufferedOutputStream(socket.getOutputStream());
 
         while (true) {
-            String line = readLine(rawIn); // ✅ читаем строго до \n, без лишнего буфера
+            String line = readLine(rawIn);
             if (line == null) {
                 System.out.println("Client disconnected (EOF)");
                 return;
@@ -79,8 +79,6 @@ public final class TcpFileServer {
         sendLine(out, "OK " + Instant.now());
     }
 
-    // UPLOAD <name> <totalSize> <offset>
-    // Далее клиент отправляет totalSize-offset байт
     private void handleUpload(String[] parts, InputStream in, OutputStream out) throws IOException {
         if (parts.length < 4) {
             sendLine(out, "ERR Usage: UPLOAD <name> <size> <offset>");
@@ -118,8 +116,6 @@ public final class TcpFileServer {
         }
     }
 
-    // DOWNLOAD <name> <offset>
-    // Сервер отвечает: OK <totalSize> и затем отправляет totalSize-offset байт
     private void handleDownload(String[] parts, OutputStream out) throws IOException {
         if (parts.length < 3) {
             sendLine(out, "ERR Usage: DOWNLOAD <name> <offset>");
@@ -150,15 +146,9 @@ public final class TcpFileServer {
 
         sendLine(out, "OK " + total);
         sendFile(out, source, offset);
-        out.flush();  // возможно надо опустить на 156 строку
-// ✅ подтверждение конца передачи на уровне приложения
+        out.flush();
         sendLine(out, "OK DONE " + total);
-
-
-
     }
-
-    // ===== data transfer =====
 
     private static String readLine(InputStream in) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream(128);
@@ -197,8 +187,6 @@ public final class TcpFileServer {
                 remaining -= n;
                 totalRead += n;
             }
-
-            printBitrate("UPLOAD bitrate", totalRead, startNs);
             return totalRead;
         }
     }
@@ -218,20 +206,13 @@ public final class TcpFileServer {
                 out.write(buf, 0, n);
                 totalSent += n;
             }
-
-            if (totalSent == raf.length() - offset) {
-                sendLine(out, "OK DONE " + totalSent);
-            }
-            printBitrate("DOWNLOAD bitrate", totalSent, startNs);
         }
     }
 
-    // ===== io helpers =====
-
     private void configureSocket(Socket socket) throws SocketException {
-        socket.setKeepAlive(true);   // SO_KEEPALIVE
-        socket.setSoTimeout(120_000); // чтобы не висеть бесконечно
-        socket.setTcpNoDelay(true);   // для команд удобно
+        socket.setKeepAlive(true);
+        socket.setSoTimeout(120_000);
+        socket.setTcpNoDelay(true);
     }
 
     private void ensureDir(File dir) throws IOException {
@@ -244,20 +225,12 @@ public final class TcpFileServer {
     private String sanitizeFileName(String raw) {
         if (raw == null || raw.isBlank()) return null;
         raw = raw.replace("\\", "/");
-        // запрещаем пути, оставляем только имя файла в текущей папке
         if (raw.contains("..") || raw.startsWith("/") || raw.contains("/")) return null;
         return raw;
     }
 
     private long parseLong(String s, long def) {
         try { return Long.parseLong(s); } catch (Exception e) { return def; }
-    }
-
-    private void printBitrate(String label, long bytes, long startNs) {
-        double sec = (System.nanoTime() - startNs) / 1_000_000_000.0;
-        if (sec <= 0.000001) return;
-        double mbit = (bytes * 8.0) / 1_000_000.0;
-        System.out.printf("%s: %.2f Mbit/s (%d bytes in %.3f s)%n", label, mbit / sec, bytes, sec);
     }
 
     public static void main(String[] args) throws Exception {
